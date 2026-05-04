@@ -1,0 +1,7 @@
+streamlit
+requests
+openai
+python-dotenv
+beautifulsoup4
+lxml
+fake-useragent
