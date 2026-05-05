@@ -210,11 +210,15 @@ Who is this product best suited for?
 Based on review volume, price point, and category — rough estimate.
 """
     FREE_MODELS = [
-        "meta-llama/llama-3.3-70b-instruct:free",
-        "google/gemma-3-27b-it:free",
-        "nousresearch/hermes-3-llama-3.1-405b:free",
-        "meta-llama/llama-3.2-3b-instruct:free",
+        "openrouter/free",                              # Meta-router: auto-picks any working free model
+        "google/gemma-3-27b-it:free",                  # Google Gemma 3 27B
+        "meta-llama/llama-3.3-70b-instruct:free",      # Llama 3.3 70B
+        "mistralai/mistral-small-3.1-24b-instruct:free", # Mistral Small 3.1
+        "qwen/qwen3-8b:free",                          # Qwen 3 8B
+        "meta-llama/llama-4-scout:free",               # Llama 4 Scout
+        "meta-llama/llama-3.2-3b-instruct:free",       # Llama 3.2 3B (lightweight fallback)
     ]
+    errors = []
     for model_id in FREE_MODELS:
         try:
             response = client.chat.completions.create(
@@ -224,10 +228,11 @@ Based on review volume, price point, and category — rough estimate.
             return response.choices[0].message.content
         except Exception as e:
             err = str(e)
-            if "404" in err or "No endpoints" in err or "429" in err or "rate" in err.lower():
+            errors.append(f"{model_id}: {err[:80]}")
+            if "404" in err or "No endpoints" in err or "429" in err or "rate" in err.lower() or "unavailable" in err.lower():
                 continue  # try next model
             return f"⚠️ **AI Error** ({model_id}): {err}"
-    return "⚠️ All free models are currently unavailable. Please try again in a moment."
+    return f"⚠️ All free models are currently unavailable. Please try again in a moment.\n\n**Details:** {'; '.join(errors)}"
 
 # ─── Competitor finder ────────────────────────────────────────────────────────
 def get_competitors(query):
