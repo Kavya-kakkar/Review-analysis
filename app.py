@@ -3,6 +3,7 @@ import requests
 import os
 import re
 import random
+import hashlib
 from bs4 import BeautifulSoup
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -48,6 +49,7 @@ def detect_source(url):
     return "generic"
 
 # ─── Strategy 1: SerpAPI Google search for Amazon product reviews ─────────────
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_via_serpapi_amazon(asin):
     """Use Google via SerpAPI to find reviews for this ASIN."""
     if not SERPAPI_KEY or not asin:
@@ -59,14 +61,14 @@ def fetch_via_serpapi_amazon(asin):
             "q": query,
             "api_key": SERPAPI_KEY,
             "num": 10
-        }, timeout=15).json()
+        }, timeout=8).json()
         snippets = []
         for r in res.get("organic_results", []):
             snippet = r.get("snippet", "")
             if snippet and len(snippet) > 40:
                 snippets.append(f"- {snippet}")
         if snippets:
-            return "\n".join(snippets[:20]), "Google → Amazon Reviews"
+            return "\n".join(snippets[:15]), "Google → Amazon Reviews"
         error = res.get("error", "")
         if error:
             return None, f"SerpAPI error: {error}"
@@ -75,25 +77,26 @@ def fetch_via_serpapi_amazon(asin):
     return None, "No snippets found"
 
 # ─── Strategy 2: SerpAPI Google search for reviews ───────────────────────────
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_via_google_search(product_name_or_url):
     if not SERPAPI_KEY:
         return None, "No SerpAPI key"
     # Build a review-focused query
-    query = f"{product_name_or_url} customer reviews site:amazon.in OR site:flipkart.com OR site:91mobiles.com OR site:smartprix.com"
+    query = f"{product_name_or_url} customer reviews site:amazon.in OR site:flipkart.com OR site:91mobiles.com"
     try:
         res = requests.get("https://serpapi.com/search.json", params={
             "engine": "google",
             "q": query,
             "api_key": SERPAPI_KEY,
-            "num": 10
-        }, timeout=15).json()
+            "num": 8
+        }, timeout=8).json()
         snippets = []
         for r in res.get("organic_results", []):
             snippet = r.get("snippet", "")
             if snippet and len(snippet) > 40:
                 snippets.append(f"- {snippet}")
         if snippets:
-            return "\n".join(snippets[:20]), "Google Search Snippets"
+            return "\n".join(snippets[:12]), "Google Search Snippets"
     except Exception as e:
         return None, str(e)
     return None, "No Google snippets found"
@@ -103,13 +106,13 @@ def fetch_via_open_review_site(product_keyword):
     """Try 91mobiles user reviews - they don't block bots heavily."""
     try:
         search_url = f"https://www.91mobiles.com/search/?search={quote_plus(product_keyword)}"
-        resp = requests.get(search_url, headers=get_headers(), timeout=12)
+        resp = requests.get(search_url, headers=get_headers(), timeout=6)
         soup = BeautifulSoup(resp.text, "lxml")
         # Try to find review text blocks
         reviews = soup.select(".user-review-content, .review-text, .review-body, [class*='review']")
         texts = [r.get_text(strip=True) for r in reviews if len(r.get_text(strip=True)) > 50]
         if texts:
-            return "\n".join([f"- {t}" for t in texts[:20]]), "91mobiles"
+            return "\n".join([f"- {t}" for t in texts[:12]]), "91mobiles"
     except Exception:
         pass
     return None, "Open site scrape failed"
@@ -117,13 +120,13 @@ def fetch_via_open_review_site(product_keyword):
 # ─── Strategy 4: Flipkart HTML scrape ────────────────────────────────────────
 def fetch_flipkart(url):
     try:
-        resp = requests.get(url, headers=get_headers(), timeout=15)
+        resp = requests.get(url, headers=get_headers(), timeout=8)
         soup = BeautifulSoup(resp.text, "lxml")
         # Flipkart review selectors (2024)
         for sel in ["div.ZmyHeo", "div.t-ZTKy", "div._6K-7Co", "div[class*='review']"]:
             blocks = soup.select(sel)
             if blocks:
-                texts = [b.get_text(strip=True) for b in blocks[:20] if len(b.get_text(strip=True)) > 30]
+                texts = [b.get_text(strip=True) for b in blocks[:12] if len(b.get_text(strip=True)) > 30]
                 if texts:
                     return "\n".join([f"- {t}" for t in texts]), "Flipkart"
     except Exception:
@@ -131,6 +134,7 @@ def fetch_flipkart(url):
     return None, "Flipkart scrape failed"
 
 # ─── Master fetch logic ───────────────────────────────────────────────────────
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_reviews(url):
     source = detect_source(url)
     log = []
@@ -162,14 +166,14 @@ def fetch_reviews(url):
     else:
         # Generic: try direct scrape
         try:
-            resp = requests.get(url, headers=get_headers(), timeout=12)
+            resp = requests.get(url, headers=get_headers(), timeout=7)
             soup = BeautifulSoup(resp.text, "lxml")
             for tag in soup(["script", "style", "nav", "header", "footer"]):
                 tag.decompose()
             candidates = (soup.select("[class*='review']") or soup.select("[class*='comment']") or soup.select("blockquote"))
             texts = [c.get_text(strip=True) for c in candidates if len(c.get_text(strip=True)) > 40]
             if texts:
-                return "\n".join([f"- {t}" for t in texts[:20]]), "Generic Page", log
+                return "\n".join([f"- {t}" for t in texts[:12]]), "Generic Page", log
         except Exception as e:
             log.append(f"Generic scrape failed: {e}")
 
@@ -181,60 +185,66 @@ def fetch_reviews(url):
     return None, source, log
 
 # ─── AI Analysis ─────────────────────────────────────────────────────────────
+@st.cache_data(ttl=1800, show_spinner=False)
 def analyze_reviews(text, product_url=""):
-    prompt = f"""You are a product research analyst. Analyze the following customer reviews and provide a detailed structured report.
+    # Trim review text to keep prompt small and fast (~3000 chars max)
+    trimmed = text[:3000] if len(text) > 3000 else text
+
+    prompt = f"""You are a product research analyst. Analyze these customer reviews and give a concise structured report.
 
 Product URL: {product_url}
 
 Customer Reviews:
-{text}
+{trimmed}
 
-Provide the following analysis in a clean, structured markdown format:
+Respond in clean markdown:
 
 ## 🏆 Top 5 Buying Reasons
-List the top 5 reasons customers buy or love this product.
+Brief bullet points.
 
 ## ❌ Top 5 Complaints
-List the top 5 issues customers face.
+Brief bullet points.
 
 ## 😊 Overall Sentiment
-Positive / Neutral / Negative with explanation and estimated rating out of 5.
+Positive / Neutral / Negative — 1 line + rating out of 5.
 
 ## 💡 Improvement Suggestions
-4-5 actionable suggestions for the seller or manufacturer.
+3-4 bullet points.
 
 ## 🎯 Target Customer Profile
-Who is this product best suited for?
+2-3 sentences.
 
 ## 💰 Estimated Monthly Revenue Range
-Based on review volume, price point, and category — rough estimate.
+1 line estimate.
 """
+    # Fastest/most-reliable first; lightweight models respond in 3-8s
     FREE_MODELS = [
-        "openrouter/free",                              # Meta-router: auto-picks any working free model
-        "google/gemma-3-27b-it:free",                  # Google Gemma 3 27B
-        "meta-llama/llama-3.3-70b-instruct:free",      # Llama 3.3 70B
-        "mistralai/mistral-small-3.1-24b-instruct:free", # Mistral Small 3.1
-        "qwen/qwen3-8b:free",                          # Qwen 3 8B
+        "meta-llama/llama-3.2-3b-instruct:free",       # Llama 3.2 3B — fastest
+        "qwen/qwen3-8b:free",                          # Qwen 3 8B — fast
         "meta-llama/llama-4-scout:free",               # Llama 4 Scout
-        "meta-llama/llama-3.2-3b-instruct:free",       # Llama 3.2 3B (lightweight fallback)
+        "google/gemma-3-27b-it:free",                  # Gemma 3 27B
+        "mistralai/mistral-small-3.1-24b-instruct:free", # Mistral Small
+        "meta-llama/llama-3.3-70b-instruct:free",      # Llama 3.3 70B — slowest free
     ]
     errors = []
     for model_id in FREE_MODELS:
         try:
             response = client.chat.completions.create(
                 model=model_id,
-                messages=[{"role": "user", "content": prompt}]
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=800,   # keep response concise & fast
+                timeout=20        # hard per-model timeout
             )
             return response.choices[0].message.content
         except Exception as e:
             err = str(e)
             errors.append(f"{model_id}: {err[:80]}")
-            if "404" in err or "No endpoints" in err or "429" in err or "rate" in err.lower() or "unavailable" in err.lower():
-                continue  # try next model
-            return f"⚠️ **AI Error** ({model_id}): {err}"
+            # Always try next model on any error
+            continue
     return f"⚠️ All free models are currently unavailable. Please try again in a moment.\n\n**Details:** {'; '.join(errors)}"
 
 # ─── Competitor finder ────────────────────────────────────────────────────────
+@st.cache_data(ttl=3600, show_spinner=False)
 def get_competitors(query):
     if not SERPAPI_KEY or not query.strip():
         return []
@@ -243,7 +253,7 @@ def get_competitors(query):
             "engine": "amazon",
             "k": query,
             "api_key": SERPAPI_KEY
-        }, timeout=10).json()
+        }, timeout=8).json()
         products = res.get("organic_results", [])[:5]
         return [(p.get("title"), p.get("price"), p.get("rating")) for p in products]
     except Exception:
