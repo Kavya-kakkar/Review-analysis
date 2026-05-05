@@ -18,11 +18,51 @@ def get_secret(key):
     except Exception:
         return os.getenv(key)
 
+OPENROUTER_API_KEY = get_secret("OPENROUTER_API_KEY")
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
-    api_key=get_secret("OPENROUTER_API_KEY")
+    api_key=OPENROUTER_API_KEY
 )
 SERPAPI_KEY = get_secret("SERPAPI_KEY")
+
+# ─── Dynamic free-model discovery ────────────────────────────────────────────
+# Known reliable free models as a static fallback
+_STATIC_FREE_MODELS = [
+    "deepseek/deepseek-chat-v3-0324:free",
+    "deepseek/deepseek-r1:free",
+    "google/gemini-2.0-flash-exp:free",
+    "microsoft/phi-4-reasoning:free",
+    "meta-llama/llama-3.1-8b-instruct:free",
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "google/gemma-3-27b-it:free",
+    "meta-llama/llama-3.2-3b-instruct:free",
+]
+
+@st.cache_data(ttl=300, show_spinner=False)  # refresh every 5 min
+def get_available_free_models():
+    """Fetch currently live free models from OpenRouter's model catalog."""
+    try:
+        resp = requests.get(
+            "https://openrouter.ai/api/v1/models",
+            headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
+            timeout=6
+        ).json()
+        models = resp.get("data", [])
+        # Keep only :free models, sort by context length (bigger = smarter)
+        free = [
+            m["id"] for m in models
+            if m.get("id", "").endswith(":free")
+               and m.get("architecture", {}).get("tokenizer", "") != ""
+        ]
+        # Prefer smaller/faster models first
+        free.sort(key=lambda x: (
+            0 if "3b" in x or "7b" in x or "8b" in x else
+            1 if "27b" in x or "24b" in x else
+            2
+        ))
+        return free[:10] if free else _STATIC_FREE_MODELS
+    except Exception:
+        return _STATIC_FREE_MODELS
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 def get_headers():
@@ -217,15 +257,8 @@ Positive / Neutral / Negative — 1 line + rating out of 5.
 ## 💰 Estimated Monthly Revenue Range
 1 line estimate.
 """
-    # Fastest/most-reliable first; lightweight models respond in 3-8s
-    FREE_MODELS = [
-        "meta-llama/llama-3.2-3b-instruct:free",       # Llama 3.2 3B — fastest
-        "qwen/qwen3-8b:free",                          # Qwen 3 8B — fast
-        "meta-llama/llama-4-scout:free",               # Llama 4 Scout
-        "google/gemma-3-27b-it:free",                  # Gemma 3 27B
-        "mistralai/mistral-small-3.1-24b-instruct:free", # Mistral Small
-        "meta-llama/llama-3.3-70b-instruct:free",      # Llama 3.3 70B — slowest free
-    ]
+    # Dynamically fetch live free models; fall back to static list if API fails
+    FREE_MODELS = get_available_free_models()
     errors = []
     for model_id in FREE_MODELS:
         try:
@@ -235,13 +268,38 @@ Positive / Neutral / Negative — 1 line + rating out of 5.
                 max_tokens=800,   # keep response concise & fast
                 timeout=20        # hard per-model timeout
             )
-            return response.choices[0].message.content
+            content = response.choices[0].message.content
+            if content and len(content.strip()) > 50:
+                return content
+            errors.append(f"{model_id}: empty response")
         except Exception as e:
             err = str(e)
-            errors.append(f"{model_id}: {err[:80]}")
-            # Always try next model on any error
+            errors.append(f"{model_id}: {err[:100]}")
+            # 404 = model not available; 429 = rate limited — both: try next
             continue
-    return f"⚠️ All free models are currently unavailable. Please try again in a moment.\n\n**Details:** {'; '.join(errors)}"
+    # If all dynamic models failed, try static fallbacks we haven't tried yet
+    tried = set(FREE_MODELS)
+    for model_id in _STATIC_FREE_MODELS:
+        if model_id in tried:
+            continue
+        try:
+            response = client.chat.completions.create(
+                model=model_id,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=800,
+                timeout=20
+            )
+            content = response.choices[0].message.content
+            if content and len(content.strip()) > 50:
+                return content
+        except Exception as e:
+            errors.append(f"{model_id}(fallback): {str(e)[:80]}")
+            continue
+    return (
+        f"⚠️ All models are currently unavailable or rate-limited. "
+        f"Please try again in 1–2 minutes.\n\n"
+        f"**Details:** {'; '.join(errors[:4])}"
+    )
 
 # ─── Competitor finder ────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
